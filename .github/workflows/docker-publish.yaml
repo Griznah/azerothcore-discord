@@ -1,0 +1,136 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+# Prevent concurrent runs on the same branch
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secretscan:
+    name: Run truffleHog secrets scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        # actions/checkout@v7.0.1 (pinned SHA: 3d3c42e5aac5ba805825da76410c181273ba90b1)
+        # NOTE: credentials may persist in artifacts, review usage
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run truffleHog secrets scan
+        # trufflesecurity/trufflehog@v3.93.7 (pinned SHA: c3e599b7163e8198a55467f3133db0e7b2a492cb)
+        uses: trufflesecurity/trufflehog@c3e599b7163e8198a55467f3133db0e7b2a492cb
+        with:
+          extra_args: --results=verified,unknown
+
+  govulncheck:
+    name: Run govulncheck (Go dependency vulnerability scan)
+    runs-on: ubuntu-latest
+    needs: secretscan
+    steps:
+      - name: Checkout repository
+        # actions/checkout@v7.0.1 (pinned SHA: 3d3c42e5aac5ba805825da76410c181273ba90b1)
+        # NOTE: credentials may persist in artifacts, review usage
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run govulncheck (Go dependency vulnerability scan)
+        # golang/govulncheck-action@v1.0.4 (pinned SHA: b625fbe08f3bccbe446d94fbf87fcc875a4f50ee)
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee
+        with:
+          go-version-input: 1.27.2
+          go-package: ./...
+
+  image-test:
+    name: Run image tests
+    runs-on: ubuntu-latest
+    needs: govulncheck
+    steps:
+      - name: Checkout repository
+        # actions/checkout@v7.0.1 (pinned SHA: 3d3c42e5aac5ba805825da76410c181273ba90b1)
+        # NOTE: credentials may persist in artifacts, review usage
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # docker/setup-buildx-action@v4.0.0 (pinned SHA: 4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd)
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Build image (local cache only)
+        id: build-local
+        # docker/build-push-action@v7.0.0 (pinned SHA: d08e5c354a6adb9ed34480a06d141179aa583294)
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294
+        with:
+          context: .
+          push: false
+          load: true
+          tags: azerothcore-discord:test
+      - name: Run container and check UID/GID
+        run: |
+          docker run --rm --entrypoint id azerothcore-discord:test -u
+          uid=$(docker run --rm --entrypoint id azerothcore-discord:test -u)
+          gid=$(docker run --rm --entrypoint id azerothcore-discord:test -g)
+          if [ "$uid" != "1001" ] || [ "$gid" != "1001" ]; then
+            echo "FATAL: Container runs as $uid:$gid, expected 1001:1001" >&2
+            exit 1
+          fi
+          echo "PASS: Container runs as non-root $uid:$gid"
+
+  build-and-push:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    needs: [govulncheck, image-test]
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout repository
+        # actions/checkout@v7.0.1 (pinned SHA: 3d3c42e5aac5ba805825da76410c181273ba90b1)
+        # NOTE: credentials may persist in artifacts, review usage
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # docker/setup-buildx-action@v4.0.0 (pinned SHA: 4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd)
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+
+      - name: Log in to GitHub Container Registry
+        # docker/login-action@v4.0.0 (pinned SHA: b45d80f862d83dbcd57f89517bcf500b2ab88fb2)
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Extract metadata
+        id: meta
+        # docker/metadata-action@v6.0.0 (pinned SHA: 030e881283bb7a6894de51c315a6bfe6a94e05cf)
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/azerothcore-discord
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        # docker/build-push-action@v7.0.0 (pinned SHA: d08e5c354a6adb9ed34480a06d141179aa583294)
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

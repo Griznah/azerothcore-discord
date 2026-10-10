@@ -1,0 +1,31 @@
+{
+  "channel_id": "1234567890123456789",
+  "update_interval": 30,
+  "blacklist_account_prefixes": ["RNDBOT"],
+  "realms": [
+    {
+      "name": "My Realm",
+      "soap": {
+        "host": "127.0.0.1",
+        "port": 7878,
+        "user": "SOAP_USER",
+        "pass": "SOAP_PASSWORD"
+      },
+      "characters_dsn": "user:password@tcp(127.0.0.1:3306)/acore_characters",
+      "auth_dsn": "user:password@tcp(127.0.0.1:3306)/acore_auth",
+      "channel_id": "1234567890123456790",
+      "player_list_cap": 25
+    },
+    {
+      "name": "Second Realm",
+      "soap": {
+        "host": "10.0.0.2",
+        "port": 7878,
+        "user": "SOAP_USER",
+        "pass": "SOAP_PASSWORD"
+      },
+      "characters_dsn": "user:password@tcp(10.0.0.2:3306)/acore_characters2",
+      "auth_dsn": "user:password@tcp(10.0.0.2:3306)/acore_auth"
+    }
+  ]
+}

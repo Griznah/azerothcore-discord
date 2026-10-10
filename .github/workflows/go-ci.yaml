@@ -1,0 +1,30 @@
+name: Go CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go-checks:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout@v7.0.1 (pinned SHA: 3d3c42e5aac5ba805825da76410c181273ba90b1)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...

@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -430,5 +432,247 @@ func TestBuildChannelEmbedsSkipsUnchanneledRealm(t *testing.T) {
 
 	if embeds := buildChannelEmbeds(cfg, statuses); len(embeds) != 0 {
 		t.Fatalf("realm without channel must be skipped, got %d embeds", len(embeds))
+	}
+}
+
+func TestLoadConfigNtfyDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := validTestConfig()
+	cfg.Realms[0].Ntfy = NtfyRealm{Enabled: true} // events omitted
+	writeTestConfig(t, path, cfg)
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	if cfg.Ntfy.Server != defaultNtfyServer {
+		t.Fatalf("ntfy.server default = %q, want %q", cfg.Ntfy.Server, defaultNtfyServer)
+	}
+	events := cfg.Realms[0].Ntfy.Events
+	if len(events) != 2 || events[0] != "offline" || events[1] != "online" {
+		t.Fatalf("default ntfy events = %v, want [offline online]", events)
+	}
+}
+
+func TestValidateConfigNtfy(t *testing.T) {
+	ntfyRealm := func(events ...string) func(*Config) {
+		return func(c *Config) { c.Realms[0].Ntfy = NtfyRealm{Enabled: true, Events: events} }
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"ntfy enabled valid", ntfyRealm("offline"), ""},
+		{"ntfy events both valid", ntfyRealm("offline", "online"), ""},
+		{"invalid event value", ntfyRealm("offline", "boom"), "invalid ntfy event"},
+		{"duplicate event value", ntfyRealm("online", "online"), "duplicate ntfy event"},
+		{
+			"duplicate realm names",
+			func(c *Config) {
+				c.Realms = append(c.Realms, c.Realms[0])
+			},
+			"duplicate realm name",
+		},
+		{
+			"duplicate derived topics",
+			func(c *Config) {
+				c.Realms[0].Ntfy = NtfyRealm{Enabled: true}
+				c.Realms = append(c.Realms, Realm{
+					Name:          "Test Realm!", // same slug as "Test Realm"
+					SOAP:          SOAPConfig{Host: "h", Port: 7878, User: "u", Pass: "p"},
+					CharactersDSN: "d",
+					AuthDSN:       "d",
+					Ntfy:          NtfyRealm{Enabled: true},
+				})
+			},
+			"collides with another realm",
+		},
+		{"empty topic slug", ntfyRealm("offline"), "empty ntfy topic"},
+		{"bad ntfy server scheme", func(c *Config) { c.Ntfy.Server = "ftp://ntfy.example.com" }, "ntfy.server must be an http(s) URL"},
+		{"ntfy server without scheme", func(c *Config) { c.Ntfy.Server = "ntfy.example.com" }, "ntfy.server must be an http(s) URL"},
+		{"https ntfy server valid", func(c *Config) { c.Ntfy.Server = "https://ntfy.example.com" }, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validTestConfig()
+			if tt.name == "empty topic slug" {
+				cfg.Realms[0].Ntfy = NtfyRealm{Enabled: true, Events: []string{"offline"}}
+				cfg.Realms[0].Name = "---" // slug collapses to empty
+			} else {
+				tt.mutate(cfg)
+			}
+			err := validateConfigStructSafeRuntime(cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected valid, got error: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestTopicForRealm(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"My Realm", "my-realm"},
+		{"Frostmourne!!", "frostmourne"},
+		{"A  B", "a-b"},                                           // collapse repeated '-'
+		{"Épée", "p-e"},                                           // non-ASCII folds to '-'
+		{"under_score-kept", "under_score-kept"},                  // allowed chars survive
+		{"--trim--", "trim"},                                      // leading/trailing '-' trimmed
+		{strings.Repeat("a", 63) + "--", strings.Repeat("a", 63)}, // truncate to 64 then trim trailing '-'
+		{strings.Repeat("b", 70), strings.Repeat("b", 64)},        // hard truncate at 64
+		{"---", ""}, // empty slug
+	}
+	for _, tt := range tests {
+		if got := topicForRealm(Realm{Name: tt.name}); got != tt.want {
+			t.Errorf("topicForRealm(%q) = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestRealmStateObserve(t *testing.T) {
+	var rs realmState
+
+	// First probe ever seen: records state silently.
+	if ev := rs.observe(true); ev != "" {
+		t.Fatalf("first probe must be silent, got %q", ev)
+	}
+	// Single blip: not confirmed.
+	if ev := rs.observe(false); ev != "" {
+		t.Fatalf("single differing probe must be silent, got %q", ev)
+	}
+	// Back to settled: streak resets.
+	if ev := rs.observe(true); ev != "" {
+		t.Fatalf("equal probe must be silent, got %q", ev)
+	}
+	// Two consecutive differing probes confirm the offline transition.
+	if ev := rs.observe(false); ev != "" {
+		t.Fatalf("first of two must be silent, got %q", ev)
+	}
+	if ev := rs.observe(false); ev != "offline" {
+		t.Fatalf("second consecutive must emit offline, got %q", ev)
+	}
+	// Same again back to online.
+	if ev := rs.observe(true); ev != "" {
+		t.Fatalf("first online diff must be silent, got %q", ev)
+	}
+	if ev := rs.observe(true); ev != "online" {
+		t.Fatalf("second online diff must emit online, got %q", ev)
+	}
+	if rs.settled != true || rs.streak != 0 {
+		t.Fatalf("state after flip = settled:%v streak:%d", rs.settled, rs.streak)
+	}
+}
+
+func TestObserveTransitionKeyedByName(t *testing.T) {
+	b := &Bot{}
+	online := realmStatus{realm: Realm{Name: "Alpha"}, online: true}
+	offline := online
+	offline.online = false
+
+	if ev := b.observeTransition(online); ev != "" {
+		t.Fatalf("first probe must be silent, got %q", ev)
+	}
+	// Rename realm → new key → silent re-baseline despite the diff.
+	renamed := online
+	renamed.realm.Name = "Beta"
+	if ev := b.observeTransition(renamed); ev != "" {
+		t.Fatalf("first probe for renamed realm must be silent, got %q", ev)
+	}
+	// Two consecutive offline probes on the original name still notify.
+	if ev := b.observeTransition(offline); ev != "" {
+		t.Fatalf("first offline diff must be silent, got %q", ev)
+	}
+	if ev := b.observeTransition(offline); ev != "offline" {
+		t.Fatalf("expected offline transition, got %q", ev)
+	}
+}
+
+func TestNotifyChannelForRealm(t *testing.T) {
+	t.Setenv("CHANNEL_ID", "env-channel")
+	cfg := &Config{ChannelID: "chan-top", NotifyChannelID: "chan-notify"}
+
+	realm := Realm{Name: "A"}
+	if got := notifyChannelForRealm(cfg, realm); got != "chan-notify" {
+		t.Fatalf("top-level notify_channel_id expected, got %s", got)
+	}
+	realm.NotifyChannelID = "chan-realm-notify"
+	if got := notifyChannelForRealm(cfg, realm); got != "chan-realm-notify" {
+		t.Fatalf("per-realm notify_channel_id must win, got %s", got)
+	}
+	realm.NotifyChannelID = ""
+	cfg.NotifyChannelID = ""
+	if got := notifyChannelForRealm(cfg, realm); got != "chan-top" {
+		t.Fatalf("status channel chain expected, got %s", got)
+	}
+	cfg.ChannelID = ""
+	realm.ChannelID = "chan-realm"
+	if got := notifyChannelForRealm(cfg, realm); got != "chan-realm" {
+		t.Fatalf("per-realm channel_id in chain expected, got %s", got)
+	}
+	realm.ChannelID = ""
+	if got := notifyChannelForRealm(cfg, realm); got != "env-channel" {
+		t.Fatalf("env fallback expected, got %s", got)
+	}
+}
+
+func TestEventMessageText(t *testing.T) {
+	if got := eventMessageText("My Realm", false, nil); got != "🔴 **My Realm** is offline" {
+		t.Errorf("offline text = %q", got)
+	}
+	if got := eventMessageText("My Realm", true, intPtr(42)); got != "🟢 **My Realm** is back online — 42 players connected" {
+		t.Errorf("online text with players = %q", got)
+	}
+	if got := eventMessageText("My Realm", true, nil); got != "🟢 **My Realm** is back online" {
+		t.Errorf("online text without players = %q", got)
+	}
+}
+
+func TestDispatchTransitionNtfyFiltering(t *testing.T) {
+	t.Setenv("CHANNEL_ID", "") // no Discord channel anywhere → event message skipped
+
+	var paths []string
+	titles := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		titles[r.URL.Path] = r.Header.Get("Title")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &Config{Ntfy: NtfyGlobal{Server: srv.URL}}
+	b := &Bot{} // nil session: safe because the Discord path is skipped
+
+	st := realmStatus{realm: Realm{Name: "Test Realm", Ntfy: NtfyRealm{Enabled: true, Events: []string{"offline"}}}}
+
+	// Selected event: published once, to the derived topic.
+	b.dispatchTransition(cfg, st, "offline")
+	if len(paths) != 1 || paths[0] != "/test-realm" {
+		t.Fatalf("expected one publish to /test-realm, got %v", paths)
+	}
+	if titles["/test-realm"] != "Test Realm offline" {
+		t.Fatalf("title = %q", titles["/test-realm"])
+	}
+
+	// Unselected event: no publish.
+	b.dispatchTransition(cfg, st, "online")
+	if len(paths) != 1 {
+		t.Fatalf("unselected event must not publish, got %v", paths)
+	}
+
+	// Disabled ntfy: no publish.
+	disabled := st
+	disabled.realm.Ntfy = NtfyRealm{Enabled: false, Events: []string{"offline", "online"}}
+	b.dispatchTransition(cfg, disabled, "offline")
+	if len(paths) != 1 {
+		t.Fatalf("disabled ntfy must not publish, got %v", paths)
 	}
 }

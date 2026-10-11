@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Griznah/azerothcore-discord/internal/mysql"
+	"github.com/Griznah/azerothcore-discord/internal/ntfy"
 	"github.com/Griznah/azerothcore-discord/internal/soap"
 	"github.com/bwmarrin/discordgo"
 )
@@ -140,30 +142,55 @@ type SOAPConfig struct {
 
 // Realm is one AzerothCore realm monitored by the bot.
 type Realm struct {
-	Name          string     `json:"name"`
-	SOAP          SOAPConfig `json:"soap"`
-	CharactersDSN string     `json:"characters_dsn"`
-	AuthDSN       string     `json:"auth_dsn"`
-	ChannelID     string     `json:"channel_id,omitempty"`      // optional: overrides top-level channel
-	PlayerListCap int        `json:"player_list_cap,omitempty"` // optional: overrides default 25
+	Name            string     `json:"name"`
+	SOAP            SOAPConfig `json:"soap"`
+	CharactersDSN   string     `json:"characters_dsn"`
+	AuthDSN         string     `json:"auth_dsn"`
+	ChannelID       string     `json:"channel_id,omitempty"`        // optional: overrides top-level channel
+	PlayerListCap   int        `json:"player_list_cap,omitempty"`   // optional: overrides default 25
+	NotifyChannelID string     `json:"notify_channel_id,omitempty"` // optional: overrides top-level notify channel
+	Ntfy            NtfyRealm  `json:"ntfy,omitempty"`              // optional: per-realm ntfy notifications
+}
+
+// NtfyGlobal is the top-level ntfy server configuration.
+type NtfyGlobal struct {
+	Server string `json:"server"`
+	Token  string `json:"token,omitempty"`
+}
+
+// NtfyRealm toggles ntfy notifications for one realm and selects which
+// transition events to publish.
+type NtfyRealm struct {
+	Enabled bool     `json:"enabled"`
+	Events  []string `json:"events,omitempty"` // offline, online
 }
 
 // Config holds application configuration loaded from config.json
 type Config struct {
-	ChannelID                string   `json:"channel_id"`
-	UpdateInterval           int      `json:"update_interval"`
-	BlacklistAccountPrefixes []string `json:"blacklist_account_prefixes"`
-	Realms                   []Realm  `json:"realms"`
+	ChannelID                string     `json:"channel_id"`
+	UpdateInterval           int        `json:"update_interval"`
+	BlacklistAccountPrefixes []string   `json:"blacklist_account_prefixes"`
+	Realms                   []Realm    `json:"realms"`
+	Ntfy                     NtfyGlobal `json:"ntfy"`
+	NotifyChannelID          string     `json:"notify_channel_id,omitempty"` // default channel for realm up/down event messages
 }
+
+const defaultNtfyServer = "https://ntfy.sh"
 
 // applyDefaults fills in unset optional values with their defaults.
 func applyDefaults(cfg *Config) {
 	if len(cfg.BlacklistAccountPrefixes) == 0 {
 		cfg.BlacklistAccountPrefixes = []string{"RNDBOT"}
 	}
+	if cfg.Ntfy.Server == "" {
+		cfg.Ntfy.Server = defaultNtfyServer
+	}
 	for i := range cfg.Realms {
 		if cfg.Realms[i].PlayerListCap == 0 {
 			cfg.Realms[i].PlayerListCap = defaultPlayerListCap
+		}
+		if len(cfg.Realms[i].Ntfy.Events) == 0 {
+			cfg.Realms[i].Ntfy.Events = []string{"offline", "online"}
 		}
 	}
 }
@@ -324,6 +351,28 @@ func getConfigPath(providedPath string) string {
 	return "/data/config.json"
 }
 
+var topicCollapseRe = regexp.MustCompile(`-{2,}`)
+
+// topicForRealm derives an ntfy topic slug from the realm name: lowercase,
+// runes outside [a-z0-9_-] become '-', runs of '-' collapse, truncate to
+// 64 chars, then trim leading/trailing '-'.
+func topicForRealm(realm Realm) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(realm.Name) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	topic := topicCollapseRe.ReplaceAllString(b.String(), "-")
+	if len(topic) > 64 {
+		topic = topic[:64]
+	}
+	return strings.Trim(topic, "-")
+}
+
 // validateConfigStruct performs fail-fast validation on loaded config
 func validateConfigStruct(cfg *Config) {
 	if err := validateConfigStructSafeRuntime(cfg); err != nil {
@@ -343,6 +392,15 @@ func validateConfigStructSafeRuntime(cfg *Config) error {
 		return fmt.Errorf("realms cannot be empty")
 	}
 
+	if cfg.Ntfy.Server != "" {
+		u, err := url.Parse(cfg.Ntfy.Server)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("ntfy.server must be an http(s) URL, got %q", cfg.Ntfy.Server)
+		}
+	}
+
+	seenNames := make(map[string]bool)
+	seenTopics := make(map[string]bool)
 	for i, realm := range cfg.Realms {
 		if realm.Name == "" {
 			return fmt.Errorf("realm at index %d has empty name", i)
@@ -361,6 +419,30 @@ func validateConfigStructSafeRuntime(cfg *Config) error {
 		}
 		if realm.AuthDSN == "" {
 			return fmt.Errorf("realm '%s' has empty auth_dsn", realm.Name)
+		}
+		if seenNames[realm.Name] {
+			return fmt.Errorf("duplicate realm name '%s'", realm.Name)
+		}
+		seenNames[realm.Name] = true
+		if realm.Ntfy.Enabled {
+			seenEvents := make(map[string]bool)
+			for _, ev := range realm.Ntfy.Events {
+				if ev != "offline" && ev != "online" {
+					return fmt.Errorf("realm '%s' has invalid ntfy event %q (valid: offline, online)", realm.Name, ev)
+				}
+				if seenEvents[ev] {
+					return fmt.Errorf("realm '%s' has duplicate ntfy event %q", realm.Name, ev)
+				}
+				seenEvents[ev] = true
+			}
+			topic := topicForRealm(realm)
+			if topic == "" {
+				return fmt.Errorf("realm '%s' derives an empty ntfy topic", realm.Name)
+			}
+			if seenTopics[topic] {
+				return fmt.Errorf("ntfy topic '%s' derived by realm '%s' collides with another realm", topic, realm.Name)
+			}
+			seenTopics[topic] = true
 		}
 	}
 
@@ -526,12 +608,135 @@ func buildChannelEmbeds(cfg *Config, statuses []realmStatus) []channelEmbed {
 	return out
 }
 
+// ================= REALM TRANSITION NOTIFICATIONS =================
+
+const ntfyTimeout = 10 * time.Second
+
+// realmState tracks one realm's settled online/offline state and the streak
+// of consecutive differing observations.
+type realmState struct {
+	seen    bool
+	settled bool
+	streak  int
+}
+
+// observe feeds one probe result into the debounce state machine and returns
+// the confirmed transition event ("offline"/"online"), or "" when nothing is
+// confirmed. The first probe ever seen for a realm records the state
+// silently; afterwards two consecutive differing probes are needed to flip
+// it, so a single blip never notifies.
+func (rs *realmState) observe(online bool) string {
+	if !rs.seen {
+		rs.seen = true
+		rs.settled = online
+		rs.streak = 0
+		return ""
+	}
+	if online == rs.settled {
+		rs.streak = 0
+		return ""
+	}
+	rs.streak++
+	if rs.streak >= 2 {
+		rs.settled = online
+		rs.streak = 0
+		if online {
+			return "online"
+		}
+		return "offline"
+	}
+	return ""
+}
+
+// observeTransition updates the per-realm debounce state (keyed by realm
+// name, so config reloads and re-added realms keep continuity) and returns
+// the confirmed transition event, if any.
+func (b *Bot) observeTransition(st realmStatus) string {
+	if b.realmStates == nil {
+		b.realmStates = make(map[string]realmState)
+	}
+	state := b.realmStates[st.realm.Name]
+	event := state.observe(st.online)
+	b.realmStates[st.realm.Name] = state
+	return event
+}
+
+// notifyChannelForRealm resolves a realm's event-message channel:
+// per-realm notify_channel_id → top-level notify_channel_id → the status
+// channel chain (per-realm channel_id → top-level channel_id → CHANNEL_ID env).
+func notifyChannelForRealm(cfg *Config, realm Realm) string {
+	if realm.NotifyChannelID != "" {
+		return realm.NotifyChannelID
+	}
+	if cfg.NotifyChannelID != "" {
+		return cfg.NotifyChannelID
+	}
+	return channelForRealm(cfg, realm)
+}
+
+// eventMessageText builds the plain-text Discord message for a confirmed
+// transition. No mentions, no embeds.
+func eventMessageText(name string, online bool, players *int) string {
+	if !online {
+		return fmt.Sprintf("🔴 **%s** is offline", name)
+	}
+	if players != nil {
+		return fmt.Sprintf("🟢 **%s** is back online — %d players connected", name, *players)
+	}
+	return fmt.Sprintf("🟢 **%s** is back online", name)
+}
+
+// eventSelected reports whether event is in the realm's ntfy events list.
+func eventSelected(events []string, event string) bool {
+	for _, ev := range events {
+		if ev == event {
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchTransition delivers one confirmed realm transition: a plain
+// Discord message to the resolved notify channel plus an ntfy publish when
+// the realm has ntfy enabled for that event. All failures are logged and
+// skipped — the update loop must never break.
+func (b *Bot) dispatchTransition(cfg *Config, st realmStatus, event string) {
+	online := event == "online"
+
+	channelID := notifyChannelForRealm(cfg, st.realm)
+	if channelID == "" {
+		log.Printf("Warning: realm '%s' has no notify channel configured, skipping event message", st.realm.Name)
+	} else if _, err := b.session.ChannelMessageSend(channelID, eventMessageText(st.realm.Name, online, st.info.PlayersOnline)); err != nil {
+		log.Printf("Error sending realm event message for '%s': %v", st.realm.Name, err)
+	}
+
+	if !st.realm.Ntfy.Enabled || !eventSelected(st.realm.Ntfy.Events, event) {
+		return
+	}
+	priority, tag := "high", "warning"
+	if online {
+		priority, tag = "default", "tada"
+	}
+	title := fmt.Sprintf("%s offline", st.realm.Name)
+	if online {
+		title = fmt.Sprintf("%s online", st.realm.Name)
+	}
+	body := strings.ReplaceAll(eventMessageText(st.realm.Name, online, st.info.PlayersOnline), "**", "")
+	ctx, cancel := context.WithTimeout(context.Background(), ntfyTimeout)
+	defer cancel()
+	client := ntfy.New(cfg.Ntfy.Server, cfg.Ntfy.Token)
+	if err := client.Publish(ctx, topicForRealm(st.realm), title, body, priority, tag); err != nil {
+		log.Printf("Error publishing ntfy notification for '%s': %v", st.realm.Name, err)
+	}
+}
+
 // ================= DISCORD INTEGRATION =================
 
 type Bot struct {
 	session        *discordgo.Session
 	configManager  *ConfigManager
 	statusMessages map[string]*discordgo.Message // one status message per channel
+	realmStates    map[string]realmState         // per realm name, survives config reloads
 	messageMutex   sync.RWMutex
 	readyOnce      sync.Once
 }
@@ -641,7 +846,9 @@ func (b *Bot) cleanupOldMessages() error {
 		deletedCount := 0
 
 		for _, msg := range messages {
-			if msg.Author.ID == botUserID {
+			// Only status embeds are managed by the bot — realm event
+			// messages (plain text, no embeds) must survive restarts.
+			if msg.Author.ID == botUserID && len(msg.Embeds) > 0 {
 				if err := b.session.ChannelMessageDelete(channelID, msg.ID); err != nil {
 					log.Printf("Failed to delete message %s: %v", msg.ID, err)
 				} else {
@@ -721,6 +928,13 @@ func (b *Bot) performUpdate() {
 			log.Printf("Error updating status in channel %s: %v", ce.channelID, err)
 		}
 	}
+
+	// Notify on confirmed realm transitions (2 consecutive differing probes)
+	for i := range statuses {
+		if event := b.observeTransition(statuses[i]); event != "" {
+			b.dispatchTransition(cfg, statuses[i], event)
+		}
+	}
 }
 
 // ================= BOT CONSTRUCTION =================
@@ -751,6 +965,7 @@ func NewBot(cfgManager *ConfigManager, token string) (*Bot, error) {
 		session:        session,
 		configManager:  cfgManager,
 		statusMessages: make(map[string]*discordgo.Message),
+		realmStates:    make(map[string]realmState),
 	}, nil
 }
 

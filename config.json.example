@@ -2,6 +2,11 @@
   "channel_id": "1234567890123456789",
   "update_interval": 30,
   "blacklist_account_prefixes": ["RNDBOT"],
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "token": ""
+  },
+  "notify_channel_id": "",
   "realms": [
     {
       "name": "My Realm",
@@ -14,7 +19,12 @@
       "characters_dsn": "user:password@tcp(127.0.0.1:3306)/acore_characters",
       "auth_dsn": "user:password@tcp(127.0.0.1:3306)/acore_auth",
       "channel_id": "1234567890123456790",
-      "player_list_cap": 25
+      "player_list_cap": 25,
+      "notify_channel_id": "1234567890123456791",
+      "ntfy": {
+        "enabled": true,
+        "events": ["offline", "online"]
+      }
     },
     {
       "name": "Second Realm",
